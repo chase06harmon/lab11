@@ -185,7 +185,8 @@ def exchange_with_neighbor_pallas_scratch_specs(x):
     #   `pltpu.SemaphoreType.REGULAR` for a single semaphore)
     #
     return {
-        # TODO: your code here
+        "send": pltpu.SemaphoreType.DMA,
+        "recv": pltpu.SemaphoreType.DMA
     }
 
 
@@ -205,8 +206,23 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
       `exchange_with_neighbor_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    my_device = pallas_get_my_device_id()
+
+    dst_device = ((my_device // 2) * 2) + ((my_device + 1) % 2)
+
+    send_sem = scratch_refs["send"]
+    recv_sem = scratch_refs["recv"]
+
+    pallas_rdma_start(
+        src_ref=x_ref, 
+        dst_ref=out_ref, 
+        dst_device_id=dst_device,
+        src_send_sem=send_sem,
+        dst_recv_sem=recv_sem
+    )
+
+    pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem)
+    pallas_rdma_wait_recv(dst_ref=out_ref, dst_recv_sem=recv_sem)
 
 
 def reduce_scatter_pallas_scratch_specs(x):
