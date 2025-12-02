@@ -1,0 +1,92 @@
+
+------------------------------------------------------------
+exchange_with_neighbor
+
+    running with per-device input shape: (1024, 8, 128)
+    rel_rmse: 0.000e+00
+
+------------------------------------------------------------
+reduce_scatter
+
+    running with per-device input shape: (16, 8, 128)
+Traceback (most recent call last):
+  File "/tmp/tmpd5oq9r4t/bin", line 812, in <module>
+    main()
+    ~~~~^^
+  File "/tmp/tmpd5oq9r4t/bin", line 774, in main
+    run_scenario(
+    ~~~~~~~~~~~~^
+        name="reduce_scatter",
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<12 lines>...
+        bytes_transferred_fn=bytes_transferred_reduce_scatter,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/tmp/tmpd5oq9r4t/bin", line 633, in run_scenario
+    actual = compute_actual(x, jnp.array(1, dtype=jnp.int32))
+  File "/tmp/tmpd5oq9r4t/bin", line 629, in compute_actual
+    actual = actual_fn(x, loop_iters=loop_iters_arr)
+  File "/tmp/tmpd5oq9r4t/bin", line 492, in reduce_scatter_pallas_launch
+    return launch_kernel_looped(
+        kernel=reduce_scatter_pallas_kernel,
+    ...<4 lines>...
+        calibrate_only=calibrate_only,
+    )
+  File "/tmp/tmpd5oq9r4t/bin", line 567, in launch_kernel_looped
+    return pl.pallas_call(
+           ~~~~~~~~~~~~~~~
+    ...<9 lines>...
+        interpret=get_interpret_params(),
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    )(input_array, loop_iters_arr)
+    ~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.cache/uv/archive-v0/mjtxXgK_bL_BgShXWeT7f/lib/python3.13/site-packages/jax/_src/pallas/pallas_call.py", line 1865, in wrapped
+    jaxpr, consts = _trace_kernel_to_jaxpr(
+                    ~~~~~~~~~~~~~~~~~~~~~~^
+        kernel, kernel_dbg, grid_mapping, flat_kernel_avals,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        kernel_in_tree, kernel_arg_transforms)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.cache/uv/archive-v0/mjtxXgK_bL_BgShXWeT7f/lib/python3.13/site-packages/jax/_src/pallas/pallas_call.py", line 1346, in _trace_kernel_to_jaxpr
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+                       ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        wrapped_kernel_fun, kernel_avals)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.cache/uv/archive-v0/mjtxXgK_bL_BgShXWeT7f/lib/python3.13/site-packages/jax/_src/pallas/primitives.py", line 821, in wrap_with_transforms
+    return f(*new_args)
+  File "/tmp/tmpd5oq9r4t/bin", line 559, in kernel_wrapper
+    lax.fori_loop(0, loop_iters_ref[0], loop_body, None)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/tmpd5oq9r4t/bin", line 546, in loop_body
+    kernel(x_ref, out_ref, scratch_refs)
+    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/tmpd5oq9r4t/bin", line 295, in reduce_scatter_pallas_kernel
+    pallas_rdma_start(
+    ~~~~~~~~~~~~~~~~~^
+        src_ref=full_left_ref,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        dst_recv_sem=full_left_recv_sem,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/tmp/tmpd5oq9r4t/bin", line 98, in pallas_rdma_start
+    ).start()
+      ~~~~~^^
+  File "/root/.cache/uv/archive-v0/mjtxXgK_bL_BgShXWeT7f/lib/python3.13/site-packages/jax/_src/pallas/mosaic/primitives.py", line 242, in start
+    dma_start_p.bind(
+    ~~~~~~~~~~~~~~~~^
+        *flat_args,
+        ^^^^^^^^^^^
+    ...<3 lines>...
+        add=add,
+        ^^^^^^^^
+    )
+    ^
+  File "/root/.cache/uv/archive-v0/mjtxXgK_bL_BgShXWeT7f/lib/python3.13/site-packages/jax/_src/pallas/mosaic/primitives.py", line 403, in _dma_start_abstract_eval
+    raise ValueError(
+        "DMA source/destination/semaphore arguments must be Refs.")
+ValueError: DMA source/destination/semaphore arguments must be Refs.
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.

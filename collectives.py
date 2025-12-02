@@ -238,18 +238,20 @@ def reduce_scatter_pallas_scratch_specs(x):
         # stage 1
         "recv_left": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
         "recv_right": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
-        "recv_left_half": pltpu.VMEM(shape=(chunk_size / 2, 8, 128), dtype=jnp.float32),
+        "recv_left_half": pltpu.VMEM(
+            shape=(chunk_size // 2, 8, 128), dtype=jnp.float32
+        ),
         "recv_right_half": pltpu.VMEM(
-            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+            shape=(chunk_size // 2, 8, 128), dtype=jnp.float32
         ),
         # stage 2
         "send2_sem": pltpu.SemaphoreType.DMA(shape=(2,)),
         "recv2_sem": pltpu.SemaphoreType.DMA(shape=(2,)),
         "recv_left_half_2": pltpu.VMEM(
-            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+            shape=(chunk_size // 2, 8, 128), dtype=jnp.float32
         ),
         "recv_right_half_2": pltpu.VMEM(
-            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+            shape=(chunk_size // 2, 8, 128), dtype=jnp.float32
         ),
         # accumulate
         "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
@@ -286,7 +288,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     # full package send left
     full_left_send_sem = send_sems_1.at[0]
     full_left_recv_sem = recv_sems_1.at[0]
-    full_left_ref = x_ref[pl.ds(chunk_length * left_dev, chunk_length)]
+    full_left_ref = x_ref.at[pl.ds(chunk_length * left_dev, chunk_length)]
     full_left_dest = scratch_refs[
         "recv_right"
     ]  # recieves from right if sends from left
@@ -301,7 +303,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     # full package send right
     full_right_send_sem = send_sems_1.at[1]
     full_right_recv_sem = recv_sems_1.at[1]
-    full_right_ref = x_ref[pl.ds(chunk_length * right_dev, chunk_length)]
+    full_right_ref = x_ref.at[pl.ds(chunk_length * right_dev, chunk_length)]
     full_right_dest = scratch_refs["recv_left"]
     pallas_rdma_start(
         src_ref=full_right_ref,
@@ -314,7 +316,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     # half package send left
     half_left_send_sem = send_sems_1.at[2]
     half_left_recv_sem = recv_sems_1.at[2]
-    half_left_ref = x_ref[pl.ds(chunk_length * accross_dev, chunk_length / 2)]
+    half_left_ref = x_ref.at[pl.ds(chunk_length * accross_dev, chunk_length // 2)]
     half_left_dest = scratch_refs["recv_right_half"]
     pallas_rdma_start(
         src_ref=half_left_ref,
@@ -327,8 +329,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     # half package send right
     half_right_send_sem = send_sems_1.at[3]
     half_right_recv_sem = recv_sems_1.at[3]
-    half_right_ref = x_ref[
-        pl.ds(chunk_length * accross_dev + chunk_length / 2, chunk_length / 2)
+    half_right_ref = x_ref.at[
+        pl.ds(chunk_length * accross_dev + chunk_length // 2, chunk_length // 2)
     ]
     half_right_dest = scratch_refs["recv_left_half"]
     pallas_rdma_start(
@@ -387,25 +389,26 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
         src_send_sem=half_right_send_sem_2,
         dst_recv_sem=half_right_recv_sem_2,
     )
-    
+
     # wait for all
     pallas_rdma_wait_send(src_ref=half_right_dest, src_send_sem=half_left_send_sem_2)
     pallas_rdma_wait_recv(dst_ref=half_left_dest_2, dst_recv_sem=half_left_recv_sem_2)
 
     pallas_rdma_wait_send(src_ref=half_left_dest, src_send_sem=half_right_send_sem_2)
     pallas_rdma_wait_recv(dst_ref=half_right_dest_2, dst_recv_sem=half_right_recv_sem_2)
-    
+
     # finish accumulation
-    accumulate_first_half = accumulate[pl.ds(0, chunk_length/2)]
-    accumulate_second_half = accumulate[pl.ds(chunk_length/2, chunk_length/2)]
-    
-    final_add_first = half_right_dest_2[pl.ds(0, chunk_length/2)]
-    final_add_second = half_left_dest_2[pl.ds(0, chunk_length/2)]
-    
+    accumulate_first_half = accumulate[pl.ds(0, chunk_length // 2)]
+    accumulate_second_half = accumulate[pl.ds(chunk_length // 2, chunk_length // 2)]
+
+    final_add_first = half_right_dest_2[pl.ds(0, chunk_length // 2)]
+    final_add_second = half_left_dest_2[pl.ds(0, chunk_length // 2)]
+
     # write first addition
-    out_ref[pl.ds(0, chunk_length/2)] = accumulate_first_half + final_add_first
-    out_ref[pl.ds(chunk_length/2, chunk_length/2)] = accumulate_second_half + final_add_second
-    
+    out_ref[pl.ds(0, chunk_length // 2)] = accumulate_first_half + final_add_first
+    out_ref[pl.ds(chunk_length // 2, chunk_length // 2)] = (
+        accumulate_second_half + final_add_second
+    )
 
 
 def all_gather_pallas_scratch_specs(x):

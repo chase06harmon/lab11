@@ -1,0 +1,53 @@
+
+------------------------------------------------------------
+exchange_with_neighbor
+
+    running with per-device input shape: (1024, 8, 128)
+    rel_rmse: 0.000e+00
+
+------------------------------------------------------------
+reduce_scatter
+
+    running with per-device input shape: (16, 8, 128)
+    rel_rmse: 1.170e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (128, 8, 128)
+    rel_rmse: 1.169e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (1024, 8, 128)
+    rel_rmse: 1.174e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (2048, 8, 128)
+    rel_rmse: 1.173e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (4096, 8, 128)
+    rel_rmse: 1.173e+00
+    kernel output is incorrect; skipping benchmarking
+
+------------------------------------------------------------
+all_gather
+
+    running with per-device input shape: (4, 8, 128)
+    rel_rmse: 1.000e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (32, 8, 128)
+    rel_rmse: 1.000e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (256, 8, 128)
+    rel_rmse: 1.000e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (512, 8, 128)
+    rel_rmse: 1.000e+00
+    kernel output is incorrect; skipping benchmarking
+
+    running with per-device input shape: (1024, 8, 128)
+    rel_rmse: 1.000e+00
+    kernel output is incorrect; skipping benchmarking
+

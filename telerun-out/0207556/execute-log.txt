@@ -1,0 +1,41 @@
+
+------------------------------------------------------------
+exchange_with_neighbor
+
+    running with per-device input shape: (1024, 8, 128)
+    rel_rmse: 0.000e+00
+
+------------------------------------------------------------
+reduce_scatter
+
+    running with per-device input shape: (16, 8, 128)
+Traceback (most recent call last):
+  File "/tmp/tmpakggcg70/bin", line 809, in <module>
+    main()
+    ~~~~^^
+  File "/tmp/tmpakggcg70/bin", line 771, in main
+    run_scenario(
+    ~~~~~~~~~~~~^
+        name="reduce_scatter",
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<12 lines>...
+        bytes_transferred_fn=bytes_transferred_reduce_scatter,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/tmp/tmpakggcg70/bin", line 630, in run_scenario
+    actual = compute_actual(x, jnp.array(1, dtype=jnp.int32))
+  File "/tmp/tmpakggcg70/bin", line 626, in compute_actual
+    actual = actual_fn(x, loop_iters=loop_iters_arr)
+  File "/tmp/tmpakggcg70/bin", line 492, in reduce_scatter_pallas_launch
+    scratch_shapes=reduce_scatter_pallas_scratch_specs(x),
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/tmp/tmpakggcg70/bin", line 241, in reduce_scatter_pallas_scratch_specs
+    "recv_left_half": pltpu.VMEM(shape=(chunk_size / 2, 8, 128), dtype=jnp.float32),
+                      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/.cache/uv/archive-v0/fnGIohL4LaJbbd_op2d-j/lib/python3.13/site-packages/jax/_src/pallas/mosaic/core.py", line 188, in __call__
+    return self.from_type(jax_core.ShapedArray(shape, dtype))
+                          ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+TypeError: Shapes must be 1D sequences of concrete values of integer type, got (2.0, 8, 128).
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
