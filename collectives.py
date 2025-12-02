@@ -184,10 +184,7 @@ def exchange_with_neighbor_pallas_scratch_specs(x):
     #   (example: `pltpu.SemaphoreType.REGULAR(shape=(2,))` for an array of 2 semaphores, or
     #   `pltpu.SemaphoreType.REGULAR` for a single semaphore)
     #
-    return {
-        "send": pltpu.SemaphoreType.DMA,
-        "recv": pltpu.SemaphoreType.DMA
-    }
+    return {"send": pltpu.SemaphoreType.DMA, "recv": pltpu.SemaphoreType.DMA}
 
 
 def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
@@ -214,11 +211,11 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
     recv_sem = scratch_refs["recv"]
 
     pallas_rdma_start(
-        src_ref=x_ref, 
-        dst_ref=out_ref, 
+        src_ref=x_ref,
+        dst_ref=out_ref,
         dst_device_id=dst_device,
         src_send_sem=send_sem,
-        dst_recv_sem=recv_sem
+        dst_recv_sem=recv_sem,
     )
 
     pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem)
@@ -234,8 +231,28 @@ def reduce_scatter_pallas_scratch_specs(x):
 
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
+    chunk_size = x.shape[0] // N_DEVICES
     return {
-        # TODO: your code here
+        "send1_sem": pltpu.SemaphoreType.DMA(shape=(4,)),
+        "recv1_sem": pltpu.SemaphoreType.DMA(shape=(4,)),
+        # stage 1
+        "recv_left": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
+        "recv_right": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
+        "recv_left_half": pltpu.VMEM(shape=(chunk_size / 2, 8, 128), dtype=jnp.float32),
+        "recv_right_half": pltpu.VMEM(
+            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+        ),
+        # stage 2
+        "send2_sem": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv2_sem": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv_left_half_2": pltpu.VMEM(
+            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+        ),
+        "recv_right_half_2": pltpu.VMEM(
+            shape=(chunk_size / 2, 8, 128), dtype=jnp.float32
+        ),
+        # accumulate
+        "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
     }
 
 
@@ -254,8 +271,141 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
       `reduce_scatter_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    dev_id = pallas_get_my_device_id()
+    right_dev = (dev_id - 1) % N_DEVICES
+    left_dev = (dev_id + 1) % N_DEVICES
+    accross_dev = (dev_id + 2) % N_DEVICES
+    N = x_ref.shape[0]  # does this work?
+    chunk_length = N // N_DEVICES
+    accumulate = scratch_refs["accumulate"]
+
+    # stage 1
+    send_sems_1 = scratch_refs["send1_sem"]
+    recv_sems_1 = scratch_refs["recv1_sem"]
+
+    # full package send left
+    full_left_send_sem = send_sems_1.at[0]
+    full_left_recv_sem = recv_sems_1.at[0]
+    full_left_ref = x_ref[pl.ds(chunk_length * left_dev, chunk_length)]
+    full_left_dest = scratch_refs[
+        "recv_right"
+    ]  # recieves from right if sends from left
+    pallas_rdma_start(
+        src_ref=full_left_ref,
+        dst_ref=full_left_dest,
+        dst_device_id=left_dev,
+        src_send_sem=full_left_send_sem,
+        dst_recv_sem=full_left_recv_sem,
+    )
+
+    # full package send right
+    full_right_send_sem = send_sems_1.at[1]
+    full_right_recv_sem = recv_sems_1.at[1]
+    full_right_ref = x_ref[pl.ds(chunk_length * right_dev, chunk_length)]
+    full_right_dest = scratch_refs["recv_left"]
+    pallas_rdma_start(
+        src_ref=full_right_ref,
+        dst_ref=full_right_dest,
+        dst_device_id=left_dev,
+        src_send_sem=full_right_send_sem,
+        dst_recv_sem=full_right_recv_sem,
+    )
+
+    # half package send left
+    half_left_send_sem = send_sems_1.at[2]
+    half_left_recv_sem = recv_sems_1.at[2]
+    half_left_ref = x_ref[pl.ds(chunk_length * accross_dev, chunk_length / 2)]
+    half_left_dest = scratch_refs["recv_right_half"]
+    pallas_rdma_start(
+        src_ref=half_left_ref,
+        dst_ref=half_left_dest,
+        dst_device_id=left_dev,
+        src_send_sem=half_left_send_sem,
+        dst_recv_sem=half_left_recv_sem,
+    )
+
+    # half package send right
+    half_right_send_sem = send_sems_1.at[3]
+    half_right_recv_sem = recv_sems_1.at[3]
+    half_right_ref = x_ref[
+        pl.ds(chunk_length * accross_dev + chunk_length / 2, chunk_length / 2)
+    ]
+    half_right_dest = scratch_refs["recv_left_half"]
+    pallas_rdma_start(
+        src_ref=half_right_ref,
+        dst_ref=half_right_dest,
+        dst_device_id=right_dev,
+        src_send_sem=half_right_send_sem,
+        dst_recv_sem=half_right_recv_sem,
+    )
+
+    # wait for full recieves
+    pallas_rdma_wait_send(src_ref=full_left_ref, src_send_sem=full_left_send_sem)
+    pallas_rdma_wait_recv(dst_ref=full_left_dest, dst_recv_sem=full_left_recv_sem)
+
+    pallas_rdma_wait_send(src_ref=full_right_ref, src_send_sem=full_right_send_sem)
+    pallas_rdma_wait_recv(dst_ref=full_right_dest, dst_recv_sem=full_right_recv_sem)
+
+    # add to accumulator
+    base_arr = x_ref[pl.ds(dev_id, chunk_length)]
+    left_arr = full_left_dest[pl.ds(0, chunk_length)]
+    right_arr = full_right_dest[pl.ds(0, chunk_length)]
+
+    accumulate[pl.ds(0, chunk_length)] = base_arr + left_arr + right_arr
+
+    # wait for half recieves
+    pallas_rdma_wait_send(src_ref=half_left_ref, src_send_sem=half_left_send_sem)
+    pallas_rdma_wait_recv(dst_ref=half_left_dest, dst_recv_sem=half_left_recv_sem)
+
+    pallas_rdma_wait_send(src_ref=half_right_ref, src_send_sem=half_right_send_sem)
+    pallas_rdma_wait_recv(dst_ref=half_right_dest, dst_recv_sem=half_right_recv_sem)
+
+    # stage 2
+    send_sems_2 = scratch_refs["send2_sem"]
+    recv_sems_2 = scratch_refs["recv2_sem"]
+
+    # half package send left 2, offset 0
+    half_left_send_sem_2 = send_sems_2.at[0]
+    half_left_recv_sem_2 = recv_sems_2.at[0]
+    half_left_dest_2 = scratch_refs["recv_right_half_2"]
+    pallas_rdma_start(
+        src_ref=half_right_dest,
+        dst_ref=half_left_dest_2,
+        dst_device_id=left_dev,
+        src_send_sem=half_left_send_sem_2,
+        dst_recv_sem=half_left_recv_sem_2,
+    )
+
+    # half package send right 2, offset chunk_length/2
+    half_right_send_sem_2 = send_sems_2.at[1]
+    half_right_recv_sem_2 = recv_sems_2.at[1]
+    half_right_dest_2 = scratch_refs["recv_right_half_2"]
+    pallas_rdma_start(
+        src_ref=half_left_dest,
+        dst_ref=half_right_dest_2,
+        dst_device_id=right_dev,
+        src_send_sem=half_right_send_sem_2,
+        dst_recv_sem=half_right_recv_sem_2,
+    )
+    
+    # wait for all
+    pallas_rdma_wait_send(src_ref=half_right_dest, src_send_sem=half_left_send_sem_2)
+    pallas_rdma_wait_recv(dst_ref=half_left_dest_2, dst_recv_sem=half_left_recv_sem_2)
+
+    pallas_rdma_wait_send(src_ref=half_left_dest, src_send_sem=half_right_send_sem_2)
+    pallas_rdma_wait_recv(dst_ref=half_right_dest_2, dst_recv_sem=half_right_recv_sem_2)
+    
+    # finish accumulation
+    accumulate_first_half = accumulate[pl.ds(0, chunk_length/2)]
+    accumulate_second_half = accumulate[pl.ds(chunk_length/2, chunk_length/2)]
+    
+    final_add_first = half_right_dest_2[pl.ds(0, chunk_length/2)]
+    final_add_second = half_left_dest_2[pl.ds(0, chunk_length/2)]
+    
+    # write first addition
+    out_ref[pl.ds(0, chunk_length/2)] = accumulate_first_half + final_add_first
+    out_ref[pl.ds(chunk_length/2, chunk_length/2)] = accumulate_second_half + final_add_second
+    
 
 
 def all_gather_pallas_scratch_specs(x):
@@ -362,11 +512,13 @@ def all_gather_pallas_launch(x, loop_iters, calibrate_only=False):
         calibrate_only=calibrate_only,
     )
 
+
 def get_interpret_params():
     if ENABLE_DEBUG:
         return pltpu.InterpretParams(detect_races=True)
     else:
         return None
+
 
 def launch_kernel_looped(
     *,
