@@ -19,7 +19,7 @@ N_DEVICES = 4
 # * Dynamic race condition detection
 # * Uninitialized data is initially filled with NaN values
 #
-ENABLE_DEBUG = False
+ENABLE_DEBUG = True
 
 
 ################################################################################
@@ -268,7 +268,16 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        # TODO: your code here
+        "semaphores": {
+            "left": {
+                "send": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+            }, 
+            "right": {
+                "send": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+            }
+        }
     }
 
 
@@ -285,9 +294,80 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       The set of resources allocated is determined by your implementation of
       `all_gather_pallas_scratch_specs`.
     """
+    
+    my_device = pallas_get_my_device_id()
 
-    # TODO: your code here
-    pass
+    N, _, _ = x_ref.shape
+
+    start_idx = my_device * N
+
+    out_ref[pl.ds(start_idx, N)] = x_ref[pl.ds(0, N)]
+
+    right_neighbor = (my_device + 1) % N_DEVICES
+    left_neighbor = (my_device - 1 ) % N_DEVICES
+
+    semaphores = scratch_refs["semaphores"]
+    
+
+    # pl.debug_print("I am: {}\tRight: {}\tLeft: {}", my_device, right_neighbor, left_neighbor)
+
+
+    for i in range(1): 
+        right_half_dev_id = ((my_device - i) % N_DEVICES)
+        left_half_dev_id = ((my_device + i) % N_DEVICES)
+
+        right_half_idx = (right_half_dev_id * N) + (N / 2)
+        left_half_idx = left_half_dev_id * N
+
+        right_half_ref = out_ref.at[pl.ds(right_half_idx, N / 2)]
+        left_half_ref = out_ref.at[pl.ds(left_half_idx, N / 2)]
+
+        pallas_rdma_start(
+            src_ref=right_half_ref, 
+            dst_ref=right_half_ref, 
+            dst_device_id=right_neighbor,
+            src_send_sem=semaphores["right"]["send"][i],
+            dst_recv_sem=semaphores["right"]["recv"][i]
+        )
+
+        pallas_rdma_start(
+            src_ref=left_half_ref, 
+            dst_ref=left_half_ref, 
+            dst_device_id=right_neighbor,
+            src_send_sem=semaphores["left"]["send"][i],
+            dst_recv_sem=semaphores["left"]["recv"][i]
+        )
+        
+        pallas_rdma_wait_send(src_ref=left_half_ref, src_send_sem=semaphores["left"]["send"][i])
+        pallas_rdma_wait_send(src_ref=right_half_ref, src_send_sem=semaphores["right"]["send"][i])
+
+        # wait for receiving data from left and right neighbors
+    
+        pallas_rdma_wait_recv(dst_ref=out_ref, dst_recv_sem=recv_sem)
+
+
+
+
+    # dst_device = ((my_device // 2) * 2) + ((my_device + 1) % 2)
+
+    # send_sem = scratch_refs["send"]
+    # recv_sem = scratch_refs["recv"]
+
+    # pallas_rdma_start(
+    #     src_ref=x_ref, 
+    #     dst_ref=out_ref, 
+    #     dst_device_id=dst_device,
+    #     src_send_sem=send_sem,
+    #     dst_recv_sem=recv_sem
+    # )
+
+    # pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem)
+    # pallas_rdma_wait_recv(dst_ref=out_ref, dst_recv_sem=recv_sem)
+
+
+    # for _ in range(N_DEVICES-1):
+
+
 
 
 ## <--- /your code here --->
