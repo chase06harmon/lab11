@@ -281,6 +281,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     chunk_length = N // N_DEVICES
     accumulate = scratch_refs["accumulate"]
 
+    # jax.debug.print(x_ref.at[pl.ds(0, 16)])
+
     # stage 1
     send_sems_1 = scratch_refs["send1_sem"]
     recv_sems_1 = scratch_refs["recv1_sem"]
@@ -308,7 +310,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     pallas_rdma_start(
         src_ref=full_right_ref,
         dst_ref=full_right_dest,
-        dst_device_id=left_dev,
+        dst_device_id=right_dev,
         src_send_sem=full_right_send_sem,
         dst_recv_sem=full_right_recv_sem,
     )
@@ -349,11 +351,11 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     pallas_rdma_wait_recv(dst_ref=full_right_dest, dst_recv_sem=full_right_recv_sem)
 
     # add to accumulator
-    base_arr = x_ref[pl.ds(dev_id, chunk_length)]
+    base_arr = x_ref[pl.ds(dev_id * chunk_length, chunk_length)]
     left_arr = full_left_dest[pl.ds(0, chunk_length)]
     right_arr = full_right_dest[pl.ds(0, chunk_length)]
 
-    accumulate[pl.ds(0, chunk_length)] = base_arr + left_arr + right_arr
+    accumulate[pl.ds(0, chunk_length)] = (base_arr + left_arr) + right_arr
 
     # wait for half recieves
     pallas_rdma_wait_send(src_ref=half_left_ref, src_send_sem=half_left_send_sem)
@@ -371,19 +373,19 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     half_left_recv_sem_2 = recv_sems_2.at[0]
     half_left_dest_2 = scratch_refs["recv_right_half_2"]
     pallas_rdma_start(
-        src_ref=half_right_dest,
+        src_ref=half_left_dest,
         dst_ref=half_left_dest_2,
         dst_device_id=left_dev,
         src_send_sem=half_left_send_sem_2,
         dst_recv_sem=half_left_recv_sem_2,
     )
 
-    # half package send right 2, offset chunk_length/2
+    # half package send right 2, offset chunk_length//2
     half_right_send_sem_2 = send_sems_2.at[1]
     half_right_recv_sem_2 = recv_sems_2.at[1]
-    half_right_dest_2 = scratch_refs["recv_right_half_2"]
+    half_right_dest_2 = scratch_refs["recv_left_half_2"]
     pallas_rdma_start(
-        src_ref=half_left_dest,
+        src_ref=half_right_dest,
         dst_ref=half_right_dest_2,
         dst_device_id=right_dev,
         src_send_sem=half_right_send_sem_2,
@@ -401,8 +403,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     accumulate_first_half = accumulate[pl.ds(0, chunk_length // 2)]
     accumulate_second_half = accumulate[pl.ds(chunk_length // 2, chunk_length // 2)]
 
-    final_add_first = half_right_dest_2[pl.ds(0, chunk_length // 2)]
-    final_add_second = half_left_dest_2[pl.ds(0, chunk_length // 2)]
+    final_add_first = half_left_dest_2[pl.ds(0, chunk_length // 2)]
+    final_add_second = half_right_dest_2[pl.ds(0, chunk_length // 2)]
 
     # write first addition
     out_ref[pl.ds(0, chunk_length // 2)] = accumulate_first_half + final_add_first
