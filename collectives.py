@@ -253,8 +253,6 @@ def reduce_scatter_pallas_scratch_specs(x):
         "recv_right_half_2": pltpu.VMEM(
             shape=(chunk_size // 2, 8, 128), dtype=jnp.float32
         ),
-        # accumulate
-        "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
     }
 
 
@@ -279,7 +277,6 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     accross_dev = (dev_id + 2) % N_DEVICES
     N = x_ref.shape[0]  # does this work?
     chunk_length = N // N_DEVICES
-    accumulate = scratch_refs["accumulate"]
 
     # jax.debug.print(x_ref.at[pl.ds(0, 16)])
 
@@ -343,20 +340,6 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_recv_sem=half_right_recv_sem,
     )
 
-    # wait for full recieves
-    pallas_rdma_wait_send(src_ref=full_left_ref, src_send_sem=full_left_send_sem)
-    pallas_rdma_wait_recv(dst_ref=full_left_dest, dst_recv_sem=full_left_recv_sem)
-
-    pallas_rdma_wait_send(src_ref=full_right_ref, src_send_sem=full_right_send_sem)
-    pallas_rdma_wait_recv(dst_ref=full_right_dest, dst_recv_sem=full_right_recv_sem)
-
-    # add to accumulator
-    base_arr = x_ref[pl.ds(dev_id * chunk_length, chunk_length)]
-    left_arr = full_left_dest[pl.ds(0, chunk_length)]
-    right_arr = full_right_dest[pl.ds(0, chunk_length)]
-
-    accumulate[pl.ds(0, chunk_length)] = (base_arr + left_arr) + right_arr
-
     # wait for half recieves
     pallas_rdma_wait_send(src_ref=half_left_ref, src_send_sem=half_left_send_sem)
     pallas_rdma_wait_recv(dst_ref=half_left_dest, dst_recv_sem=half_left_recv_sem)
@@ -399,9 +382,23 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     pallas_rdma_wait_send(src_ref=half_left_dest, src_send_sem=half_right_send_sem_2)
     pallas_rdma_wait_recv(dst_ref=half_right_dest_2, dst_recv_sem=half_right_recv_sem_2)
 
+    # wait for full recieves
+    pallas_rdma_wait_send(src_ref=full_left_ref, src_send_sem=full_left_send_sem)
+    pallas_rdma_wait_recv(dst_ref=full_left_dest, dst_recv_sem=full_left_recv_sem)
+
+    pallas_rdma_wait_send(src_ref=full_right_ref, src_send_sem=full_right_send_sem)
+    pallas_rdma_wait_recv(dst_ref=full_right_dest, dst_recv_sem=full_right_recv_sem)
+
+    # add to accumulator
+    base_arr = x_ref[pl.ds(dev_id * chunk_length, chunk_length)]
+    left_arr = full_left_dest[pl.ds(0, chunk_length)]
+    right_arr = full_right_dest[pl.ds(0, chunk_length)]
+
+    temp_acc = (base_arr + left_arr) + right_arr
+
     # finish accumulation
-    accumulate_first_half = accumulate[pl.ds(0, chunk_length // 2)]
-    accumulate_second_half = accumulate[pl.ds(chunk_length // 2, chunk_length // 2)]
+    accumulate_first_half = temp_acc[: chunk_length // 2]
+    accumulate_second_half = temp_acc[chunk_length // 2 :]
 
     final_add_first = half_left_dest_2[pl.ds(0, chunk_length // 2)]
     final_add_second = half_right_dest_2[pl.ds(0, chunk_length // 2)]
