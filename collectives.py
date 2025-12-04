@@ -19,7 +19,7 @@ N_DEVICES = 4
 # * Dynamic race condition detection
 # * Uninitialized data is initially filled with NaN values
 #
-ENABLE_DEBUG = True
+ENABLE_DEBUG = False
 
 
 ################################################################################
@@ -268,12 +268,17 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
+        "buffer": pltpu.VMEM(shape=(x.shape[0]*N_DEVICES, *x.shape[1:]), dtype=x.dtype),
         "semaphores": {
             "left": {
                 "send": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
                 "recv": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
             }, 
             "right": {
+                "send": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
+            },
+            "far": {
                 "send": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
                 "recv": pltpu.SemaphoreType.DMA(shape=(N_DEVICES-1,)),
             }
@@ -301,49 +306,149 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
 
     start_idx = my_device * N
 
-    out_ref[pl.ds(start_idx, N)] = x_ref[pl.ds(0, N)]
-
     right_neighbor = (my_device + 1) % N_DEVICES
     left_neighbor = (my_device - 1 ) % N_DEVICES
+    far_neighbor = (my_device + 2) % N_DEVICES
 
     semaphores = scratch_refs["semaphores"]
+    buf = scratch_refs["buffer"]
+
+    buf[pl.ds(start_idx, N)] = x_ref[pl.ds(0, N)]
+
+    my_section = buf.at[pl.ds(start_idx, N)]
+
+    pallas_rdma_start(
+        src_ref=my_section, 
+        dst_ref=my_section,
+        dst_device_id=right_neighbor,
+        src_send_sem=semaphores["right"]["send"].at[0],
+        dst_recv_sem=semaphores["right"]["recv"].at[0],
+    )
+
+    pallas_rdma_start(
+        src_ref=my_section, 
+        dst_ref=my_section,
+        dst_device_id=left_neighbor,
+        src_send_sem=semaphores["left"]["send"].at[0],
+        dst_recv_sem=semaphores["left"]["recv"].at[0],
+    )
+
+    # pallas_rdma_start(
+    #     src_ref=my_section, 
+    #     dst_ref=my_section,
+    #     dst_device_id=far_neighbor,
+    #     src_send_sem=semaphores["far"]["send"].at[0],
+    #     dst_recv_sem=semaphores["far"]["recv"].at[0],
+    # )
+    
+    left_idx = left_neighbor * N
+    right_idx = right_neighbor * N
+    # far_idx = far_neighbor * N
+
+    left_slice = pl.ds(left_idx, N)
+    right_slice = pl.ds(right_idx, N)
+    # far_slice = pl.ds(far_idx, N)
+
+    left_ref = buf.at[left_slice]
+    right_ref = buf.at[right_slice]
+    # far_ref = buf.at[far_slice]
+
+    pallas_rdma_wait_recv(dst_ref=left_ref, dst_recv_sem=semaphores["left"]["recv"].at[0])
+    pallas_rdma_wait_recv(dst_ref=right_ref, dst_recv_sem=semaphores["right"]["recv"].at[0])
+    # pallas_rdma_wait_recv(dst_ref=far_ref, dst_recv_sem=semaphores["far"]["recv"].at[0])
+
+    left_half_of_left_ref = left_ref.at[pl.ds(0, N//2)]
+    right_half_of_right_ref = right_ref.at[pl.ds(N//2, N//2)]
+
+    
+    pallas_rdma_start(
+        src_ref=left_half_of_left_ref, 
+        dst_ref=left_half_of_left_ref,
+        dst_device_id=right_neighbor,
+        src_send_sem=semaphores["right"]["send"].at[1],
+        dst_recv_sem=semaphores["right"]["recv"].at[1],
+    )
+
+    pallas_rdma_start(
+        src_ref=right_half_of_right_ref, 
+        dst_ref=right_half_of_right_ref,
+        dst_device_id=left_neighbor,
+        src_send_sem=semaphores["left"]["send"].at[1],
+        dst_recv_sem=semaphores["left"]["recv"].at[1],
+    )
+
+    far_idx = far_neighbor * N
+    far_slice = pl.ds(far_idx, N)
+
+    remaining_ref = buf.at[far_slice]
+    left_half_remaining = remaining_ref.at[pl.ds(0, N//2)]
+    right_half_remaining = remaining_ref.at[pl.ds(N//2, N//2)]
+
+    pallas_rdma_wait_recv(dst_ref=left_half_remaining, dst_recv_sem=semaphores["left"]["recv"].at[1])
+    pallas_rdma_wait_recv(dst_ref=right_half_remaining, dst_recv_sem=semaphores["right"]["recv"].at[1])
+
+    pallas_rdma_wait_send(src_ref=my_section, src_send_sem=semaphores["left"]["send"].at[0])
+    pallas_rdma_wait_send(src_ref=my_section, src_send_sem=semaphores["right"]["send"].at[0])
+
+    pallas_rdma_wait_send(src_ref=left_half_of_left_ref, src_send_sem=semaphores["right"]["send"].at[1])
+    pallas_rdma_wait_send(src_ref=right_half_of_right_ref, src_send_sem=semaphores["left"]["send"].at[1])
+
+    out_ref[...] = buf[...]
+    
+    
+    # for i in range(1, N_DEVICES):
+    #     next_idx = ((my_device + i) % N_DEVICES) * N
+    #     out_ref[pl.ds(next_idx, N)] = jnp.zeros(x_ref.shape, x_ref.dtype)
+
+
+    # semaphores = scratch_refs["semaphores"]
     
 
-    # pl.debug_print("I am: {}\tRight: {}\tLeft: {}", my_device, right_neighbor, left_neighbor)
+    # # pl.debug_print("I am: {}\tRight: {}\tLeft: {}", my_device, right_neighbor, left_neighbor)
 
 
-    for i in range(1): 
-        right_half_dev_id = ((my_device - i) % N_DEVICES)
-        left_half_dev_id = ((my_device + i) % N_DEVICES)
+    # for i in range(1): 
+    #     right_half_dev_id = ((my_device + i) % N_DEVICES)
+    #     left_half_dev_id = ((my_device - i) % N_DEVICES)
 
-        right_half_idx = (right_half_dev_id * N) + (N / 2)
-        left_half_idx = left_half_dev_id * N
+    #     right_half_idx = (right_half_dev_id * N) + (N / 2)
+    #     left_half_idx = left_half_dev_id * N
 
-        right_half_ref = out_ref.at[pl.ds(right_half_idx, N / 2)]
-        left_half_ref = out_ref.at[pl.ds(left_half_idx, N / 2)]
+    #     right_half_ref = out_ref.at[pl.ds(right_half_idx, N / 2)]
+    #     left_half_ref = out_ref.at[pl.ds(left_half_idx, N / 2)]
 
-        pallas_rdma_start(
-            src_ref=right_half_ref, 
-            dst_ref=right_half_ref, 
-            dst_device_id=right_neighbor,
-            src_send_sem=semaphores["right"]["send"][i],
-            dst_recv_sem=semaphores["right"]["recv"][i]
-        )
+    #     pallas_rdma_start(
+    #         src_ref=right_half_ref, 
+    #         dst_ref=right_half_ref, 
+    #         dst_device_id=right_neighbor,
+    #         src_send_sem=semaphores["right"]["send"][i],
+    #         dst_recv_sem=semaphores["right"]["recv"][i]
+    #     )
 
-        pallas_rdma_start(
-            src_ref=left_half_ref, 
-            dst_ref=left_half_ref, 
-            dst_device_id=right_neighbor,
-            src_send_sem=semaphores["left"]["send"][i],
-            dst_recv_sem=semaphores["left"]["recv"][i]
-        )
+    #     pallas_rdma_start(
+    #         src_ref=left_half_ref, 
+    #         dst_ref=left_half_ref, 
+    #         dst_device_id=left_neighbor,
+    #         src_send_sem=semaphores["left"]["send"][i],
+    #         dst_recv_sem=semaphores["left"]["recv"][i]
+    #     )
         
-        pallas_rdma_wait_send(src_ref=left_half_ref, src_send_sem=semaphores["left"]["send"][i])
-        pallas_rdma_wait_send(src_ref=right_half_ref, src_send_sem=semaphores["right"]["send"][i])
+    #     pallas_rdma_wait_send(src_ref=left_half_ref, src_send_sem=semaphores["left"]["send"][i])
+    #     pallas_rdma_wait_send(src_ref=right_half_ref, src_send_sem=semaphores["right"]["send"][i])
 
-        # wait for receiving data from left and right neighbors
+    #     # wait for receiving data from left and right neighbors
+
+    #     last_round_right_half_dev_id = ((my_device - i - 1) % N_DEVICES)
+    #     last_round_left_half_dev_id = ((my_device + i + 1) % N_DEVICES)
+
+    #     last_round_right_half_idx = (last_round_right_half_dev_id * N) + (N / 2)
+    #     last_round_left_half_idx = last_round_left_half_dev_id * N
+
+    #     last_round_right_half_ref = out_ref.at[pl.ds(last_round_right_half_idx, N / 2)]
+    #     last_round_left_half_ref = out_ref.at[pl.ds(last_round_left_half_idx, N / 2)]
     
-        pallas_rdma_wait_recv(dst_ref=out_ref, dst_recv_sem=recv_sem)
+    #     pallas_rdma_wait_recv(dst_ref=last_round_right_half_ref, dst_recv_sem=semaphores["left"]["recv"][i])
+    #     pallas_rdma_wait_recv(dst_ref=last_round_left_half_ref, dst_recv_sem=semaphores["right"]["recv"][i])
 
 
 
