@@ -537,7 +537,6 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       `all_gather_pallas_scratch_specs`.
     """
 
-    STAGE_1_SPLIT = get_split(x_ref.shape[0])
     dev_id = pallas_get_my_device_id()
     right_dev = (dev_id - 1) % N_DEVICES
     left_dev = (dev_id + 1) % N_DEVICES
