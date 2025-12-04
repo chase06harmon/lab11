@@ -242,8 +242,8 @@ def reduce_scatter_pallas_scratch_specs(x):
     STAGE_1_SPLIT = get_split(x.shape[0])
     chunk_size = x.shape[0] // N_DEVICES
     return {
-        "send_sem_full_1": pltpu.SemaphoreType.DMA(shape=(2 * STAGE_1_SPLIT,)),
-        "recv_sem_full_1": pltpu.SemaphoreType.DMA(shape=(2 * STAGE_1_SPLIT,)),
+        "send_sem_full_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "recv_sem_full_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
         "send_sem_half_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
         "recv_sem_half_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
         "send_sem_half_2": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
@@ -258,7 +258,7 @@ def reduce_scatter_pallas_scratch_specs(x):
         ),
         "accross_dest": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
         # accumulate
-        "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
+        # "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
     }
 
 
@@ -283,11 +283,10 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     accross_dev = (dev_id + 2) % N_DEVICES
     N = x_ref.shape[0]  # does this work?
     chunk_length = N // N_DEVICES
-    accumulate = scratch_refs["accumulate"].at[pl.ds(0, chunk_length)]
     base_arr = x_ref[pl.ds(dev_id * chunk_length, chunk_length)]
     # out_ref[pl.ds(0, chunk_length)] = base_arr
 
-    accumulate[pl.ds(0, chunk_length)] = base_arr
+    out_ref[pl.ds(0, chunk_length)] = base_arr
 
     # jax.debug.print(x_ref.at[pl.ds(0, 16)])
     left_dest = scratch_refs["left_dest"]  # recieves from right if sends from left
@@ -453,9 +452,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             dst_recv_sem=recv_sems_full_1.at[2 * i],
         )
 
-        accumulate[pl.ds(offset + half, length)] += left_dest[
-            pl.ds(offset + half, length)
-        ]
+        out_ref[pl.ds(offset + half, length)] += left_dest[pl.ds(offset + half, length)]
 
         # right wait
         pallas_rdma_wait_send(
@@ -467,7 +464,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             dst_recv_sem=recv_sems_full_1.at[2 * i + 1],
         )
 
-        accumulate[pl.ds(offset, length)] += right_dest[pl.ds(offset, length)]
+        out_ref[pl.ds(offset, length)] += right_dest[pl.ds(offset, length)]
 
     # wait for accross chunks and accumulate
     for i in range(STAGE_1_SPLIT // 2):
@@ -486,7 +483,7 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             dst_recv_sem=recv_sems_half_2.at[i],
         )
 
-        accumulate[pl.ds(offset, length)] += accross_dest[pl.ds(offset, length)]
+        out_ref[pl.ds(offset, length)] += accross_dest[pl.ds(offset, length)]
 
         # right wait
         pallas_rdma_wait_send(
@@ -498,11 +495,11 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             dst_recv_sem=recv_sems_half_2.at[i + half_sem],
         )
 
-        accumulate[pl.ds(offset + half, length)] += accross_dest[
+        out_ref[pl.ds(offset + half, length)] += accross_dest[
             pl.ds(offset + half, length)
         ]
 
-    out_ref[pl.ds(0, chunk_length)] = accumulate[pl.ds(0, chunk_length)]
+    # out_ref[pl.ds(0, chunk_length)] = accumulate[pl.ds(0, chunk_length)]
 
 
 def all_gather_pallas_scratch_specs(x):
@@ -514,8 +511,15 @@ def all_gather_pallas_scratch_specs(x):
 
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
+    STAGE_1_SPLIT = get_split(x.shape[0])
+    chunk_size = x.shape[0]
     return {
-        # TODO: your code here
+        "send_sem_full_1": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv_sem_full_1": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "send_sem_half_1": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv_sem_half_1": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "send_sem_half_2": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv_sem_half_2": pltpu.SemaphoreType.DMA(shape=(2,)),
     }
 
 
@@ -533,8 +537,166 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       `all_gather_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    STAGE_1_SPLIT = get_split(x_ref.shape[0])
+    dev_id = pallas_get_my_device_id()
+    right_dev = (dev_id - 1) % N_DEVICES
+    left_dev = (dev_id + 1) % N_DEVICES
+    N = x_ref.shape[0]  # does this work?
+
+    # out_ref[pl.ds(0, chunk_length)] = base_arr
+
+    out_ref[pl.ds(dev_id * N, N)] = x_ref[pl.ds(0, N)]
+
+    # jax.debug.print(x_ref.at[pl.ds(0, 16)])
+
+    # [left full, right full,]
+    send_sems_full_1 = scratch_refs["send_sem_full_1"]
+    recv_sems_full_1 = scratch_refs["recv_sem_full_1"]
+    send_sems_half_1 = scratch_refs["send_sem_half_1"]
+    recv_sems_half_1 = scratch_refs["recv_sem_half_1"]
+
+    send_sems_half_2 = scratch_refs["send_sem_half_2"]
+    recv_sems_half_2 = scratch_refs["recv_sem_half_2"]
+
+    # # send stage 1 for across chunks, split each way
+    half = N // 2
+
+    # stage 1 for neighbor full chunks
+    # send left shards
+    left_send_sem = send_sems_full_1.at[0]
+    left_recv_sem = recv_sems_full_1.at[0]
+    left_src_ref = x_ref.at[pl.ds(0, half)]
+    left_dst_ref = out_ref.at[pl.ds(N * dev_id, half)]
+    pallas_rdma_start(
+        src_ref=left_src_ref,
+        dst_ref=left_dst_ref,
+        dst_device_id=left_dev,
+        src_send_sem=left_send_sem,
+        dst_recv_sem=left_recv_sem,
+    )
+
+    # send right shards
+    right_send_sem = send_sems_full_1.at[1]
+    right_recv_sem = recv_sems_full_1.at[1]
+    right_src_ref = x_ref.at[pl.ds(half, half)]
+    right_dst_ref = out_ref.at[pl.ds(N * dev_id + half, half)]
+    pallas_rdma_start(
+        src_ref=right_src_ref,
+        dst_ref=right_dst_ref,
+        dst_device_id=right_dev,
+        src_send_sem=right_send_sem,
+        dst_recv_sem=right_recv_sem,
+    )
+
+    left_send_sem = send_sems_half_1.at[0]
+    left_recv_sem = recv_sems_half_1.at[0]
+    left_src_ref = x_ref.at[pl.ds(half, half)]
+    left_dst_ref = out_ref.at[pl.ds(N * dev_id + half, half)]
+    pallas_rdma_start(
+        src_ref=left_src_ref,
+        dst_ref=left_dst_ref,
+        dst_device_id=left_dev,
+        src_send_sem=left_send_sem,
+        dst_recv_sem=left_recv_sem,
+    )
+
+    # send right shards
+    right_send_sem = send_sems_half_1.at[1]
+    right_recv_sem = recv_sems_half_1.at[1]
+    right_src_ref = x_ref.at[pl.ds(0, half)]
+    right_dst_ref = out_ref.at[pl.ds(N * dev_id, half)]
+    pallas_rdma_start(
+        src_ref=right_src_ref,
+        dst_ref=right_dst_ref,
+        dst_device_id=right_dev,
+        src_send_sem=right_send_sem,
+        dst_recv_sem=right_recv_sem,
+    )
+
+    # left wait
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, half)],
+        src_send_sem=send_sems_full_1.at[0],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(N * right_dev, half)],
+        dst_recv_sem=recv_sems_full_1.at[0],
+    )
+
+    # send left shards
+    left_send_sem = send_sems_half_2.at[0]
+    left_recv_sem = recv_sems_half_2.at[0]
+    left_src_ref = out_ref.at[pl.ds(N * right_dev, half)]
+    left_dst_ref = out_ref.at[pl.ds(N * right_dev, half)]
+    pallas_rdma_start(
+        src_ref=left_src_ref,
+        dst_ref=left_dst_ref,
+        dst_device_id=left_dev,
+        src_send_sem=left_send_sem,
+        dst_recv_sem=left_recv_sem,
+    )
+
+    # right wait
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(half, half)],
+        src_send_sem=send_sems_full_1.at[1],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(N * left_dev + half, half)],
+        dst_recv_sem=recv_sems_full_1.at[1],
+    )
+
+    # send right shards
+    right_send_sem = send_sems_half_2.at[1]
+    right_recv_sem = recv_sems_half_2.at[1]
+    right_src_ref = out_ref.at[pl.ds(N * left_dev + half, half)]
+    right_dst_ref = out_ref.at[pl.ds(N * left_dev + half, half)]
+    pallas_rdma_start(
+        src_ref=right_src_ref,
+        dst_ref=right_dst_ref,
+        dst_device_id=right_dev,
+        src_send_sem=right_send_sem,
+        dst_recv_sem=right_recv_sem,
+    )
+
+    # wait!
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(half, half)],
+        src_send_sem=send_sems_half_1.at[0],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(N * right_dev + half, half)],
+        dst_recv_sem=recv_sems_half_1.at[0],
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, half)],
+        src_send_sem=send_sems_half_1.at[1],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(N * left_dev, half)],
+        dst_recv_sem=recv_sems_half_1.at[1],
+    )
+
+    # left wait
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(right_dev * N, half)],
+        src_send_sem=send_sems_half_2.at[0],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(right_dev * N, half)],
+        dst_recv_sem=recv_sems_half_2.at[0],
+    )
+
+    # right wait
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(N * left_dev + half, half)],
+        src_send_sem=send_sems_half_2.at[1],
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(N * left_dev + half, half)],
+        dst_recv_sem=recv_sems_half_2.at[1],
+    )
 
 
 ## <--- /your code here --->
