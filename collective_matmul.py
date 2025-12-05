@@ -181,15 +181,28 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
     All arrays are in VMEM and have dtype bfloat16.
     """
 
-    # TODO: your code here
-    pass
+    out_ref[...] = jnp.astype(pl.dot(x_ref[...], w_ref[...]), jnp.bfloat16)
 
+MAX_NUM_SPLITS = 8
 
 def all_gather_matmul_pallas_scratch_specs(x):
     return {
-        # TODO: your code here
+        "buf": pltpu.VMEM(shape=(x.shape[0] * N_DEVICES, x.shape[1], *x.shape[2:]), dtype=x.dtype),
+        "semaphores": {
+            "left": {
+                "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(2, MAX_NUM_SPLITS)),
+            }, 
+            "right": {
+                "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+            },
+        }
     }
 
+
+def mul_helper(x_ref, w1_ref, out_ref):
+    out_ref[...] += jnp.astype(pl.dot(x_ref[...], w1_ref[...]), jnp.bfloat16)
 
 def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     """
@@ -203,14 +216,165 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     All arrays are in VMEM and have dtype bfloat16.
     """
 
-    # TODO: your code here
-    pass
+    # Goal: Gather all x_refs along second dimension... then matmul with w1_ref?
 
+    my_device = pallas_get_my_device_id()
+
+    N, K1_DIV_N_DEVICES = x_ref.shape
+
+    NUM_SPLITS = min(N, MAX_NUM_SPLITS)
+
+    start_idx = my_device * N
+
+    right_neighbor = (my_device + 1) % N_DEVICES
+    left_neighbor = (my_device - 1 ) % N_DEVICES
+    far_neighbor = (my_device + 2) % N_DEVICES
+
+    semaphores = scratch_refs["semaphores"]
+    buf = scratch_refs["buf"]
+
+    buf[pl.ds(start_idx, N)] = x_ref[pl.ds(0, N)]
+    
+    split_size = N // NUM_SPLITS
+
+    for i in range(NUM_SPLITS):
+        left_to_right_section = buf.at[pl.ds(start_idx + (split_size * i), split_size)]
+        right_to_left_section = buf.at[pl.ds(start_idx + N - (split_size * (i+1)), split_size)]
+
+        pallas_rdma_start(
+            src_ref=left_to_right_section, 
+            dst_ref=left_to_right_section,
+            dst_device_id=right_neighbor,
+            src_send_sem=semaphores["right"]["send"].at[0,i],
+            dst_recv_sem=semaphores["right"]["recv"].at[0,i],
+        )
+
+        pallas_rdma_start(
+            src_ref=right_to_left_section, 
+            dst_ref=right_to_left_section,
+            dst_device_id=left_neighbor,
+            src_send_sem=semaphores["left"]["send"].at[0,i],
+            dst_recv_sem=semaphores["left"]["recv"].at[0,i],
+        )
+
+    mul_helper(x_ref, w1_ref.at[pl.ds(my_device*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref)
+
+    for i in range(NUM_SPLITS):
+        left_idx = left_neighbor * N
+        right_idx = right_neighbor * N
+
+        left_slice = pl.ds(left_idx + (split_size * i), split_size)
+        right_slice = pl.ds(right_idx + N - (split_size * (i+1)), split_size)
+
+        from_left_neighbor_sending_from_left_to_right_section = buf.at[left_slice]
+        from_right_neighbor_sending_from_right_to_left_section = buf.at[right_slice]
+
+        pallas_rdma_wait_recv(dst_ref=from_left_neighbor_sending_from_left_to_right_section, dst_recv_sem=semaphores["right"]["recv"].at[0,i])
+        pallas_rdma_wait_recv(dst_ref=from_right_neighbor_sending_from_right_to_left_section, dst_recv_sem=semaphores["left"]["recv"].at[0,i])
+
+        # pallas_rdma_wait_recv(dst_ref=from_left_neighbor_sending_from_left_to_right_section, dst_recv_sem=semaphores["left"]["recv"].at[0,i])
+        
+        # # mul_helper(from_left_neighbor_sending_from_left_to_right_section, w1_ref.at[pl.ds(left_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref.at[pl.ds(split_size * i, split_size)])
+        
+        # pallas_rdma_wait_recv(dst_ref=from_right_neighbor_sending_from_right_to_left_section, dst_recv_sem=semaphores["right"]["recv"].at[0,i])
+
+        # mul_helper(from_right_neighbor_sending_from_right_to_left_section, w1_ref.at[pl.ds(right_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref.at[pl.ds(N - (split_size * (i+1)), split_size)])
+
+        if (i < NUM_SPLITS // 2): 
+            pallas_rdma_start(
+                src_ref=from_left_neighbor_sending_from_left_to_right_section, 
+                dst_ref=from_left_neighbor_sending_from_left_to_right_section,
+                dst_device_id=right_neighbor,
+                src_send_sem=semaphores["right"]["send"].at[1,i],
+                dst_recv_sem=semaphores["right"]["recv"].at[1,i],
+            )
+
+            pallas_rdma_start(
+                src_ref=from_right_neighbor_sending_from_right_to_left_section, 
+                dst_ref=from_right_neighbor_sending_from_right_to_left_section,
+                dst_device_id=left_neighbor,
+                src_send_sem=semaphores["left"]["send"].at[1,i],
+                dst_recv_sem=semaphores["left"]["recv"].at[1,i],
+            )
+
+    mul_helper(buf.at[pl.ds(left_neighbor*N, N)], w1_ref.at[pl.ds(left_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref)
+    mul_helper(buf.at[pl.ds(right_neighbor*N, N)], w1_ref.at[pl.ds(right_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref)
+
+    far_idx = far_neighbor * N
+    far_slice = pl.ds(far_idx, N)
+
+    remaining_ref = buf.at[far_slice]
+
+    for i in range(NUM_SPLITS // 2):
+        left_half_remaining_section = remaining_ref.at[pl.ds(split_size*i, split_size)]
+        right_half_remaining_section = remaining_ref.at[pl.ds(N - (split_size*(i+1)), split_size)]
+        pallas_rdma_wait_recv(dst_ref=left_half_remaining_section, dst_recv_sem=semaphores["right"]["recv"].at[1,i])
+        pallas_rdma_wait_recv(dst_ref=right_half_remaining_section, dst_recv_sem=semaphores["left"]["recv"].at[1,i])
+        
+        # pallas_rdma_wait_recv(dst_ref=left_half_remaining_section, dst_recv_sem=semaphores["left"]["recv"].at[1,i])
+        # # mul_helper(left_half_remaining_section, w1_ref.at[pl.ds(far_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref.at[pl.ds(split_size*i, split_size)])
+
+        # pallas_rdma_wait_recv(dst_ref=right_half_remaining_section, dst_recv_sem=semaphores["right"]["recv"].at[1,i])
+        # mul_helper(right_half_remaining_section, w1_ref.at[pl.ds(far_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref.at[pl.ds(N - (split_size*(i+1)), split_size)])
+
+    mul_helper(buf.at[pl.ds(far_neighbor*N, N)], w1_ref.at[pl.ds(far_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref)
+
+    # for i in range(N_DEVICES):
+    #     out_ref[...] += jnp.astype(pl.dot(buf[pl.ds(i*N, N)], w1_ref[pl.ds(K1_DIV_N_DEVICES*i, K1_DIV_N_DEVICES)]), jnp.bfloat16)
+
+    for i in range(NUM_SPLITS):
+        left_to_right_section = buf.at[pl.ds(start_idx + (split_size * i), split_size)]
+        right_to_left_section = buf.at[pl.ds(start_idx + N - (split_size * (i+1)), split_size)]
+
+        pallas_rdma_wait_send(src_ref=left_to_right_section, src_send_sem=semaphores["right"]["send"].at[0, i])
+        pallas_rdma_wait_send(src_ref=right_to_left_section, src_send_sem=semaphores["left"]["send"].at[0, i])
+
+    for i in range(NUM_SPLITS // 2):
+        left_idx = left_neighbor * N
+        right_idx = right_neighbor * N
+
+        left_slice = pl.ds(left_idx + (split_size * i), split_size)
+        right_slice = pl.ds(right_idx + N - (split_size * (i+1)), split_size)
+
+        from_left_neighbor_sending_from_left_to_right_section = buf.at[left_slice]
+        from_right_neighbor_sending_from_right_to_left_section = buf.at[right_slice]
+        
+        pallas_rdma_wait_send(src_ref=from_left_neighbor_sending_from_left_to_right_section, src_send_sem=semaphores["right"]["send"].at[1, i])
+        pallas_rdma_wait_send(src_ref=from_right_neighbor_sending_from_right_to_left_section, src_send_sem=semaphores["left"]["send"].at[1, i])
+
+
+# NOTE: COULD OBTAIN THESE AT RUN TIME BY PASSING MORE THAN X
+K1 = 1024
+K2 = 4096
+N = 256
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
     return {
-        # TODO: your code here
+        "mul_buffers": pltpu.VMEM(shape=(N_DEVICES * N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+        "forward_buf": pltpu.VMEM(shape=(N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+        "final_buf": pltpu.VMEM(shape=(2*N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+        "semaphores": {
+            "left": {
+                "send": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(3,1)),
+            }, 
+            "right": {
+                "send": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                "recv": pltpu.SemaphoreType.DMA(shape=(3,1)),
+            },
+        }
     }
+
+def bf16_add_in_f32(dst_ref, src_ref):
+    tmp = jnp.astype(dst_ref[...], jnp.float32)
+    tmp += jnp.astype(src_ref[...], jnp.float32)
+    dst_ref[...] = jnp.astype(tmp, jnp.bfloat16)
+
+
+def mul_helper2(x_ref, w1_ref, out_ref):
+    tmp = jnp.astype(out_ref[...], jnp.float32)
+    tmp += pl.dot(jnp.astype(x_ref[...], jnp.float32), jnp.astype(w1_ref[...], jnp.float32))
+    out_ref[...] = jnp.astype(tmp, jnp.bfloat16)
 
 
 def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
@@ -223,13 +387,307 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     * out_ref: [N_BATCH, K1 / N_DEVICES]
     """
 
-    # TODO: your code here
-    pass
+    my_device = pallas_get_my_device_id()
 
+    K1_DIV_N_DEVICES = K1 // N_DEVICES
+
+
+    forward_buf = scratch_refs["forward_buf"]
+    final_buf = scratch_refs["final_buf"]
+    semaphores = scratch_refs["semaphores"]
+    scratch_refs["mul_buffers"][...] = jnp.zeros_like(scratch_refs["mul_buffers"][...])
+
+    right_neighbor = (my_device + 1) % N_DEVICES
+    left_neighbor = (my_device - 1 ) % N_DEVICES
+    far_neighbor = (my_device + 2) % N_DEVICES
+
+    # right_slice = pl.ds(right_neighbor * N, N)
+    # left_slice = pl.ds(left_neighbor * N, N)
+    # far_slice = pl.ds(far_neighbor * N, N)
+    # my_slice = pl.ds(my_device * N, N)
+
+    right_ref = scratch_refs["mul_buffers"].at[pl.ds(right_neighbor * N, N)]
+    left_ref = scratch_refs["mul_buffers"].at[pl.ds(left_neighbor * N, N)]
+    far_ref = scratch_refs["mul_buffers"].at[pl.ds(far_neighbor * N, N)]
+    local_ref = scratch_refs["mul_buffers"].at[pl.ds(my_device * N, N)]
+
+    # jax.debug.print("stuff ig:\n{}\n", jnp.max(jnp.abs(x_ref[...]), axis=0, keepdims=True))
+
+    x_ref[...] /= 0.5
+
+    # for i in range(N_DEVICES):
+    #     mul_helper(x_ref, w2_ref.at[:, pl.ds(i*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], scratch_refs["mul_buffers"].at[pl.ds(i*N, N)])
+
+    forward_buf_clockwise = forward_buf.at[pl.ds(0, N//2)]
+    forward_buf_counter_clock_wise = forward_buf.at[pl.ds(N//2, N//2)]
+
+    mul_helper(x_ref, w2_ref.at[:, pl.ds(far_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], far_ref)
+
+    src_clockwise = far_ref.at[pl.ds(0, N//2)] # left half of far
+    src_counter_clockwise = far_ref.at[pl.ds(N//2, N//2)] # right half of far
+
+    pallas_rdma_start(
+        src_ref=src_counter_clockwise, 
+        dst_ref=forward_buf_counter_clock_wise,
+        dst_device_id=left_neighbor,
+        src_send_sem=semaphores["left"]["send"].at[0,0],
+        dst_recv_sem=semaphores["left"]["recv"].at[0,0],
+    )
+
+    pallas_rdma_start(
+        src_ref=src_clockwise, 
+        dst_ref=forward_buf_clockwise,
+        dst_device_id=right_neighbor,
+        src_send_sem=semaphores["right"]["send"].at[0,0],
+        dst_recv_sem=semaphores["right"]["recv"].at[0,0],
+    )
+
+    src_to_left_neighbor = left_ref.at[pl.ds(0, N//2)]
+    src_to_right_neighbor = right_ref.at[pl.ds(N//2, N//2)]
+
+    clockwise_neighbor_buf_dest = final_buf.at[pl.ds(0, N)]
+    counter_clockwise_neighbor_buf_dest = final_buf.at[pl.ds(N, N)]
+
+    dest_to_left_neighbor = counter_clockwise_neighbor_buf_dest.at[pl.ds(0, N//2)]
+    dest_to_right_neighbor = clockwise_neighbor_buf_dest.at[pl.ds(N//2, N//2)]
+
+    mul_helper(x_ref, w2_ref.at[:, pl.ds(left_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], left_ref)
+
+    pallas_rdma_start(
+        src_ref=src_to_left_neighbor, 
+        dst_ref=dest_to_left_neighbor,
+        dst_device_id=left_neighbor,
+        src_send_sem=semaphores["left"]["send"].at[1,0],
+        dst_recv_sem=semaphores["left"]["recv"].at[1,0],
+    )
+
+    mul_helper(x_ref, w2_ref.at[:, pl.ds(right_neighbor*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], right_ref)
+
+    pallas_rdma_start(
+        src_ref=src_to_right_neighbor, 
+        dst_ref=dest_to_right_neighbor,
+        dst_device_id=right_neighbor,
+        src_send_sem=semaphores["right"]["send"].at[1,0],
+        dst_recv_sem=semaphores["right"]["recv"].at[1,0],
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=forward_buf_counter_clock_wise, dst_recv_sem=semaphores["left"]["recv"].at[0,0])
+    pallas_rdma_wait_recv(dst_ref=forward_buf_clockwise, dst_recv_sem=semaphores["right"]["recv"].at[0,0])
+
+    # bf16_add_in_f32(left_ref.at[pl.ds(N//2, N//2)], forward_buf_counter_clock_wise)
+    # bf16_add_in_f32(right_ref.at[pl.ds(0, N//2)], forward_buf_clockwise)
+    left_ref[pl.ds(N//2,N//2)] += forward_buf_counter_clock_wise[...]
+    right_ref[pl.ds(0, N//2)] += forward_buf_clockwise[...]
+
+    dest_to_left_neighbor2 = counter_clockwise_neighbor_buf_dest.at[pl.ds(N//2, N//2)]
+    dest_to_right_neighbor2 = clockwise_neighbor_buf_dest.at[pl.ds(0, N//2)]
+
+    pallas_rdma_start(
+        src_ref=left_ref.at[pl.ds(N//2,N//2)], 
+        dst_ref=dest_to_left_neighbor2,
+        dst_device_id=left_neighbor,
+        src_send_sem=semaphores["left"]["send"].at[2,0],
+        dst_recv_sem=semaphores["left"]["recv"].at[2,0],
+    )
+
+    pallas_rdma_start(
+        src_ref=right_ref.at[pl.ds(0,N//2)], 
+        dst_ref=dest_to_right_neighbor2,
+        dst_device_id=right_neighbor,
+        src_send_sem=semaphores["right"]["send"].at[2,0],
+        dst_recv_sem=semaphores["right"]["recv"].at[2,0],
+    )
+
+    mul_helper(x_ref, w2_ref.at[:, pl.ds(my_device*K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)], out_ref)
+
+    pallas_rdma_wait_recv(dst_ref=dest_to_left_neighbor, dst_recv_sem=semaphores["left"]["recv"].at[1,0])
+    pallas_rdma_wait_recv(dst_ref=dest_to_right_neighbor, dst_recv_sem=semaphores["right"]["recv"].at[1,0])
+    
+    out_ref[pl.ds(0, N//2)] += dest_to_left_neighbor[...] 
+    out_ref[pl.ds(N//2, N//2)] += dest_to_right_neighbor[...]
+
+    # bf16_add_in_f32(out_ref.at[pl.ds(0, N//2)], dest_to_left_neighbor)
+    # bf16_add_in_f32(out_ref.at[pl.ds(N//2, N//2)], dest_to_right_neighbor)
+
+    pallas_rdma_wait_recv(dst_ref=dest_to_left_neighbor2, dst_recv_sem=semaphores["left"]["recv"].at[2,0])
+    pallas_rdma_wait_recv(dst_ref=dest_to_right_neighbor2, dst_recv_sem=semaphores["right"]["recv"].at[2,0])
+
+    out_ref[pl.ds(N//2, N//2)] += dest_to_left_neighbor2[...]
+    out_ref[pl.ds(0, N//2)] += dest_to_right_neighbor2[...]
+    
+
+    # bf16_add_in_f32(out_ref.at[pl.ds(N//2, N//2)], dest_to_left_neighbor2)
+    # bf16_add_in_f32(out_ref.at[pl.ds(0, N//2)], dest_to_right_neighbor2)
+
+    pallas_rdma_wait_send(src_ref=src_counter_clockwise, src_send_sem=semaphores["left"]["send"].at[0,0])
+    pallas_rdma_wait_send(src_ref=src_clockwise, src_send_sem=semaphores["right"]["send"].at[0,0])
+
+    pallas_rdma_wait_send(src_ref=src_to_left_neighbor, src_send_sem=semaphores["left"]["send"].at[1,0])
+    pallas_rdma_wait_send(src_ref=src_to_right_neighbor, src_send_sem=semaphores["right"]["send"].at[1,0])
+
+    pallas_rdma_wait_send(src_ref=left_ref.at[pl.ds(N//2,N//2)], src_send_sem=semaphores["left"]["send"].at[2,0])
+    pallas_rdma_wait_send(src_ref=right_ref.at[pl.ds(0,N//2)], src_send_sem=semaphores["right"]["send"].at[2,0])
+
+    out_ref[...] *= 0.5
+
+def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
+    my_device = pallas_get_my_device_id()
+
+    N, K1_DIV_N_DEVICES = x_ref.shape
+
+    NUM_SPLITS = min(N, MAX_NUM_SPLITS)
+
+    start_idx = my_device * N
+
+    right_neighbor = (my_device + 1) % N_DEVICES
+    left_neighbor = (my_device - 1 ) % N_DEVICES
+    far_neighbor = (my_device + 2) % N_DEVICES
+
+    semaphores = scratch_refs["semaphores"]
+    buf = scratch_refs["buf"]
+
+    buf[pl.ds(start_idx, N)] = x_ref[pl.ds(0, N)]
+    
+    split_size = N // NUM_SPLITS
+
+    for i in range(NUM_SPLITS):
+        left_to_right_section = buf.at[pl.ds(start_idx + (split_size * i), split_size)]
+        right_to_left_section = buf.at[pl.ds(start_idx + N - (split_size * (i+1)), split_size)]
+
+        pallas_rdma_start(
+            src_ref=left_to_right_section, 
+            dst_ref=left_to_right_section,
+            dst_device_id=right_neighbor,
+            src_send_sem=semaphores["right"]["send"].at[0,i],
+            dst_recv_sem=semaphores["right"]["recv"].at[0,i],
+        )
+
+        pallas_rdma_start(
+            src_ref=right_to_left_section, 
+            dst_ref=right_to_left_section,
+            dst_device_id=left_neighbor,
+            src_send_sem=semaphores["left"]["send"].at[0,i],
+            dst_recv_sem=semaphores["left"]["recv"].at[0,i],
+        )
+
+    for i in range(NUM_SPLITS):
+        left_idx = left_neighbor * N
+        right_idx = right_neighbor * N
+
+        left_slice = pl.ds(left_idx + (split_size * i), split_size)
+        right_slice = pl.ds(right_idx + N - (split_size * (i+1)), split_size)
+
+        from_left_neighbor_sending_from_left_to_right_section = buf.at[left_slice]
+        from_right_neighbor_sending_from_right_to_left_section = buf.at[right_slice]
+
+        pallas_rdma_wait_recv(dst_ref=from_left_neighbor_sending_from_left_to_right_section, dst_recv_sem=semaphores["right"]["recv"].at[0,i])
+        pallas_rdma_wait_recv(dst_ref=from_right_neighbor_sending_from_right_to_left_section, dst_recv_sem=semaphores["left"]["recv"].at[0,i])
+
+        if (i < NUM_SPLITS // 2): 
+            pallas_rdma_start(
+                src_ref=from_left_neighbor_sending_from_left_to_right_section, 
+                dst_ref=from_left_neighbor_sending_from_left_to_right_section,
+                dst_device_id=right_neighbor,
+                src_send_sem=semaphores["right"]["send"].at[1,i],
+                dst_recv_sem=semaphores["right"]["recv"].at[1,i],
+            )
+
+            pallas_rdma_start(
+                src_ref=from_right_neighbor_sending_from_right_to_left_section, 
+                dst_ref=from_right_neighbor_sending_from_right_to_left_section,
+                dst_device_id=left_neighbor,
+                src_send_sem=semaphores["left"]["send"].at[1,i],
+                dst_recv_sem=semaphores["left"]["recv"].at[1,i],
+            )
+
+    far_idx = far_neighbor * N
+    far_slice = pl.ds(far_idx, N)
+
+    remaining_ref = buf.at[far_slice]
+
+    for i in range(NUM_SPLITS // 2):
+        left_half_remaining_section = remaining_ref.at[pl.ds(split_size*i, split_size)]
+        right_half_remaining_section = remaining_ref.at[pl.ds(N - (split_size*(i+1)), split_size)]
+        pallas_rdma_wait_recv(dst_ref=left_half_remaining_section, dst_recv_sem=semaphores["right"]["recv"].at[1,i])
+        pallas_rdma_wait_recv(dst_ref=right_half_remaining_section, dst_recv_sem=semaphores["left"]["recv"].at[1,i])
+
+    for i in range(NUM_SPLITS):
+        left_to_right_section = buf.at[pl.ds(start_idx + (split_size * i), split_size)]
+        right_to_left_section = buf.at[pl.ds(start_idx + N - (split_size * (i+1)), split_size)]
+
+        pallas_rdma_wait_send(src_ref=left_to_right_section, src_send_sem=semaphores["right"]["send"].at[0, i])
+        pallas_rdma_wait_send(src_ref=right_to_left_section, src_send_sem=semaphores["left"]["send"].at[0, i])
+
+    for i in range(NUM_SPLITS // 2):
+        left_idx = left_neighbor * N
+        right_idx = right_neighbor * N
+
+        left_slice = pl.ds(left_idx + (split_size * i), split_size)
+        right_slice = pl.ds(right_idx + N - (split_size * (i+1)), split_size)
+
+        from_left_neighbor_sending_from_left_to_right_section = buf.at[left_slice]
+        from_right_neighbor_sending_from_right_to_left_section = buf.at[right_slice]
+        
+        pallas_rdma_wait_send(src_ref=from_left_neighbor_sending_from_left_to_right_section, src_send_sem=semaphores["right"]["send"].at[1, i])
+        pallas_rdma_wait_send(src_ref=from_right_neighbor_sending_from_right_to_left_section, src_send_sem=semaphores["left"]["send"].at[1, i])
+
+    for i in range(N_DEVICES):
+        out_ref[:, pl.ds(i* K1_DIV_N_DEVICES, K1_DIV_N_DEVICES)] = buf[pl.ds(i*N, N), :]
 
 def neural_network_pallas_scratch_specs(x, w1_refs, w2_refs):
+    N_LAYERS = len(w1_refs)
+
+    all_gather_output_shape = (x.shape[0], w1_refs[0].shape[1])
+    reduce_scatter_output_shape = (x.shape[0], x.shape[1] // N_DEVICES)
+
     return {
-        # TODO: your code here
+        "reduce_scatter_placeholder": pltpu.VMEM(shape=reduce_scatter_output_shape, dtype=x.dtype),
+        "all_gather_placeholder": pltpu.VMEM(shape=all_gather_output_shape, dtype=x.dtype),
+
+        "per_round_scratch": {i: {
+            "reduce_scatter_stuff": {
+                "mul_buffers": pltpu.VMEM(shape=(N_DEVICES * N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+                "forward_buf": pltpu.VMEM(shape=(N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+                "final_buf": pltpu.VMEM(shape=(2*N_BATCH, K1 // N_DEVICES), dtype=x.dtype),
+                "semaphores": {
+                    "left": {
+                        "send": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                        "recv": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                    }, 
+                    "right": {
+                        "send": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                        "recv": pltpu.SemaphoreType.DMA(shape=(3,1)),
+                    },
+                }
+            },
+
+            "all_gather_stuff": {
+                "buf": pltpu.VMEM(shape=(reduce_scatter_output_shape[0] * N_DEVICES, reduce_scatter_output_shape[1], *reduce_scatter_output_shape[2:]), dtype=x.dtype),
+                "semaphores": {
+                    "left": {
+                        "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                        "recv": pltpu.SemaphoreType.DMA(shape=(2, MAX_NUM_SPLITS)),
+                    }, 
+                    "right": {
+                        "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                        "recv": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                    },
+                }
+            },
+        } for i in range(N_LAYERS)},
+        "other_all_gather_stuff": {
+            "buf": pltpu.VMEM(shape=(reduce_scatter_output_shape[0] * N_DEVICES, reduce_scatter_output_shape[1], *reduce_scatter_output_shape[2:]), dtype=x.dtype),
+            "semaphores": {
+                "left": {
+                    "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                    "recv": pltpu.SemaphoreType.DMA(shape=(2, MAX_NUM_SPLITS)),
+                }, 
+                "right": {
+                    "send": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                    "recv": pltpu.SemaphoreType.DMA(shape=(2,MAX_NUM_SPLITS)),
+                },
+            }
+        }
     }
 
 
@@ -252,8 +710,38 @@ def neural_network_pallas_kernel(init_x_ref, w1_refs, w2_refs, out_ref, scratch_
     * out_ref: Pallas array reference with shape [N_BATCH, K1]. Should be written to.
     """
 
-    # TODO: your code here
-    pass
+    # Note: Instead of zeroing... could just allocate MORE
+
+
+    N_LAYERS = w1_refs.shape[0]
+
+    reduce_scatter_placeholder = scratch_refs["reduce_scatter_placeholder"]
+    all_gather_placeholder = scratch_refs["all_gather_placeholder"]
+
+    for i in range(N_LAYERS):
+        cur_scratch = scratch_refs["per_round_scratch"][i]
+
+        w1 = w1_refs.at[i]
+        w2 = w2_refs.at[i]
+
+        if i > 0: 
+            all_gather_placeholder[...] = jnp.zeros_like(all_gather_placeholder[...])
+            all_gather_matmul_pallas_kernel(reduce_scatter_placeholder, w1, all_gather_placeholder, cur_scratch["all_gather_stuff"])
+        
+        else: 
+            all_gather_placeholder[...] = jnp.astype(pl.dot(init_x_ref[...], w1[...]), jnp.bfloat16)
+
+
+        all_gather_placeholder[...] = jax.nn.gelu(all_gather_placeholder[...])
+
+        reduce_scatter_placeholder[...] = jnp.zeros_like(reduce_scatter_placeholder[...])
+
+        matmul_reduce_scatter_pallas_kernel(all_gather_placeholder, w2, reduce_scatter_placeholder, cur_scratch["reduce_scatter_stuff"])
+
+    
+    all_gather_pallas_kernel(reduce_scatter_placeholder, out_ref, scratch_refs["other_all_gather_stuff"])
+
+        
 
 
 ## <--- /your code here --->

@@ -474,8 +474,8 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
         from_left_neighbor_sending_from_left_to_right_section = buf.at[left_slice]
         from_right_neighbor_sending_from_right_to_left_section = buf.at[right_slice]
 
-        pallas_rdma_wait_recv(dst_ref=from_left_neighbor_sending_from_left_to_right_section, dst_recv_sem=semaphores["left"]["recv"].at[0,i])
-        pallas_rdma_wait_recv(dst_ref=from_right_neighbor_sending_from_right_to_left_section, dst_recv_sem=semaphores["right"]["recv"].at[0,i])
+        pallas_rdma_wait_recv(dst_ref=from_left_neighbor_sending_from_left_to_right_section, dst_recv_sem=semaphores["right"]["recv"].at[0,i])
+        pallas_rdma_wait_recv(dst_ref=from_right_neighbor_sending_from_right_to_left_section, dst_recv_sem=semaphores["left"]["recv"].at[0,i])
 
         if (i < NUM_SPLITS // 2): 
             pallas_rdma_start(
@@ -502,15 +502,15 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
     for i in range(NUM_SPLITS // 2):
         left_half_remaining_section = remaining_ref.at[pl.ds(split_size*i, split_size)]
         right_half_remaining_section = remaining_ref.at[pl.ds(N - (split_size*(i+1)), split_size)]
-        pallas_rdma_wait_recv(dst_ref=left_half_remaining_section, dst_recv_sem=semaphores["left"]["recv"].at[1,i])
-        pallas_rdma_wait_recv(dst_ref=right_half_remaining_section, dst_recv_sem=semaphores["right"]["recv"].at[1,i])
+        pallas_rdma_wait_recv(dst_ref=left_half_remaining_section, dst_recv_sem=semaphores["right"]["recv"].at[1,i])
+        pallas_rdma_wait_recv(dst_ref=right_half_remaining_section, dst_recv_sem=semaphores["left"]["recv"].at[1,i])
 
     for i in range(NUM_SPLITS):
         left_to_right_section = buf.at[pl.ds(start_idx + (split_size * i), split_size)]
         right_to_left_section = buf.at[pl.ds(start_idx + N - (split_size * (i+1)), split_size)]
 
-        pallas_rdma_wait_send(src_ref=left_to_right_section, src_send_sem=semaphores["left"]["send"].at[0, i])
-        pallas_rdma_wait_send(src_ref=right_to_left_section, src_send_sem=semaphores["right"]["send"].at[0, i])
+        pallas_rdma_wait_send(src_ref=left_to_right_section, src_send_sem=semaphores["right"]["send"].at[0, i])
+        pallas_rdma_wait_send(src_ref=right_to_left_section, src_send_sem=semaphores["left"]["send"].at[0, i])
 
     for i in range(NUM_SPLITS // 2):
         left_idx = left_neighbor * N
