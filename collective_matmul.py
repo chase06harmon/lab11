@@ -451,9 +451,36 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     )
 
 
+def get_split(n):
+    min_bound = 2
+    max_bound = 32
+    split = n // 32
+
+    return 2
+
+
 def matmul_reduce_scatter_pallas_scratch_specs(x):
+    STAGE_1_SPLIT = get_split(x.shape[1])
+    chunk_size = 1024 // N_DEVICES
     return {
-        # TODO: your code here
+        "send_sem_full_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "recv_sem_full_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "send_sem_half_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "recv_sem_half_1": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "send_sem_half_2": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "recv_sem_half_2": pltpu.SemaphoreType.DMA(shape=(STAGE_1_SPLIT,)),
+        "right_dest": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        "left_dest": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        "accross_right_dest": pltpu.VMEM(
+            shape=(x.shape[0], chunk_size // 2), dtype=jnp.bfloat16
+        ),
+        "accross_left_dest": pltpu.VMEM(
+            shape=(x.shape[0], chunk_size // 2), dtype=jnp.bfloat16
+        ),
+        "accross_dest": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        # accumulate
+        # "accumulate": pltpu.VMEM(shape=(chunk_size, 8, 128), dtype=jnp.float32),
+        "matmul": pltpu.VMEM(shape=(x.shape[0], 1024), dtype=jnp.bfloat16),
     }
 
 
@@ -467,8 +494,333 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     * out_ref: [N_BATCH, K1 / N_DEVICES]
     """
 
-    # TODO: your code here
-    pass
+    dev_id = pallas_get_my_device_id()
+    right_dev = (dev_id - 1) % N_DEVICES
+    left_dev = (dev_id + 1) % N_DEVICES
+    accross_dev = (dev_id + 2) % N_DEVICES
+    N_BATCH, K2 = x_ref.shape  # does this work?
+    K1 = w2_ref.shape[1]
+    STAGE_1_SPLIT = get_split(K1)
+    chunk_length = K1 // N_DEVICES
+
+    # out_ref[pl.ds(0, chunk_length)] = base_arr
+
+    # jax.debug.print(x_ref.at[pl.ds(0, 16)])
+    left_dest = scratch_refs["left_dest"]  # recieves from right if sends from left
+    right_dest = scratch_refs["right_dest"]
+    accross_right_dest = scratch_refs["accross_right_dest"]
+    accross_left_dest = scratch_refs["accross_left_dest"]
+    accross_dest = scratch_refs["accross_dest"]
+
+    # [left full, right full,]
+    send_sems_full_1 = scratch_refs["send_sem_full_1"]
+    recv_sems_full_1 = scratch_refs["recv_sem_full_1"]
+
+    send_sems_half_1 = scratch_refs["send_sem_half_1"]
+    recv_sems_half_1 = scratch_refs["recv_sem_half_1"]
+    send_sems_half_2 = scratch_refs["send_sem_half_2"]
+    recv_sems_half_2 = scratch_refs["recv_sem_half_2"]
+
+    matmul = scratch_refs["matmul"]  # N_BATCH, K1
+
+    # send stage 1 for across chunks, split each way
+    for i in range(STAGE_1_SPLIT // 2):
+        length = chunk_length // (STAGE_1_SPLIT)
+        offset = i * length
+        half = chunk_length // 2
+        half_sem = STAGE_1_SPLIT // 2
+
+        # send left shards
+        matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * accross_dev + offset, length)
+        ] = jnp.astype(
+            pl.dot(
+                x_ref[...],
+                w2_ref[
+                    pl.ds(0, K2), pl.ds(chunk_length * accross_dev + offset, length)
+                ],
+            ),
+            jnp.bfloat16,
+        )
+
+        left_send_sem = send_sems_half_1.at[i]
+        left_recv_sem = recv_sems_half_1.at[i]
+        left_src_ref = matmul.at[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * accross_dev + offset, length)
+        ]
+        left_dst_ref = accross_left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        pallas_rdma_start(
+            src_ref=left_src_ref,
+            dst_ref=left_dst_ref,
+            dst_device_id=left_dev,
+            src_send_sem=left_send_sem,
+            dst_recv_sem=left_recv_sem,
+        )
+
+        # send right shards
+        matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * accross_dev + offset + half, length)
+        ] = jnp.astype(
+            pl.dot(
+                x_ref[...],
+                w2_ref[
+                    pl.ds(0, K2),
+                    pl.ds(chunk_length * accross_dev + offset + half, length),
+                ],
+            ),
+            jnp.bfloat16,
+        )
+
+        right_send_sem = send_sems_half_1.at[i + half_sem]
+        right_recv_sem = recv_sems_half_1.at[i + half_sem]
+        right_src_ref = matmul.at[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * accross_dev + offset + half, length)
+        ]
+        right_dst_ref = accross_right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        pallas_rdma_start(
+            src_ref=right_src_ref,
+            dst_ref=right_dst_ref,
+            dst_device_id=right_dev,
+            src_send_sem=right_send_sem,
+            dst_recv_sem=right_recv_sem,
+        )
+
+    # stage 1 for neighbor full chunks
+    for i in range(STAGE_1_SPLIT // 2):
+        length = chunk_length // (STAGE_1_SPLIT)
+        offset = i * length
+        half = chunk_length // 2
+
+        # send left shards
+        matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * left_dev + offset + half, length)
+        ] = jnp.astype(
+            pl.dot(
+                x_ref[...],
+                w2_ref[
+                    pl.ds(0, K2), pl.ds(chunk_length * left_dev + offset + half, length)
+                ],
+            ),
+            jnp.bfloat16,
+        )
+
+        left_send_sem = send_sems_full_1.at[2 * i]
+        left_recv_sem = recv_sems_full_1.at[2 * i]
+        left_src_ref = matmul.at[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * left_dev + offset + half, length)
+        ]
+        left_dst_ref = left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset + half, length)]
+        pallas_rdma_start(
+            src_ref=left_src_ref,
+            dst_ref=left_dst_ref,
+            dst_device_id=left_dev,
+            src_send_sem=left_send_sem,
+            dst_recv_sem=left_recv_sem,
+        )
+
+        # send right shards
+        matmul[pl.ds(0, N_BATCH), pl.ds(chunk_length * right_dev + offset, length)] = (
+            jnp.astype(
+                pl.dot(
+                    x_ref[...],
+                    w2_ref[
+                        pl.ds(0, K2), pl.ds(chunk_length * right_dev + offset, length)
+                    ],
+                ),
+                jnp.bfloat16,
+            )
+        )
+
+        right_send_sem = send_sems_full_1.at[2 * i + 1]
+        right_recv_sem = recv_sems_full_1.at[2 * i + 1]
+        right_src_ref = matmul.at[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * right_dev + offset, length)
+        ]
+        right_dst_ref = right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        pallas_rdma_start(
+            src_ref=right_src_ref,
+            dst_ref=right_dst_ref,
+            dst_device_id=right_dev,
+            src_send_sem=right_send_sem,
+            dst_recv_sem=right_recv_sem,
+        )
+
+    # wait on accross chunks and correspondingly send
+    for i in range(STAGE_1_SPLIT // 2):
+        length = chunk_length // (STAGE_1_SPLIT)
+        offset = i * length
+        half = chunk_length // 2
+        half_sem = STAGE_1_SPLIT // 2
+
+        # left wait
+        pallas_rdma_wait_send(
+            src_ref=matmul.at[
+                pl.ds(0, N_BATCH), pl.ds(chunk_length * accross_dev + offset, length)
+            ],
+            src_send_sem=send_sems_half_1.at[i],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=accross_left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            dst_recv_sem=recv_sems_half_1.at[i],
+        )
+
+        # add remaining full chunk
+        matmul[pl.ds(0, N_BATCH), pl.ds(chunk_length * left_dev + offset, length)] = (
+            jnp.astype(
+                pl.dot(
+                    x_ref[...],
+                    w2_ref[
+                        pl.ds(0, K2), pl.ds(chunk_length * left_dev + offset, length)
+                    ],
+                ),
+                jnp.bfloat16,
+            )
+        )
+        accross_left_dest[pl.ds(0, N_BATCH), pl.ds(offset, length)] += matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * left_dev + offset, length)
+        ]
+
+        # send left shards to final destination
+        left_send_sem = send_sems_half_2.at[i]
+        left_recv_sem = recv_sems_half_2.at[i]
+        left_src_ref = accross_left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        left_dst_ref = accross_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        pallas_rdma_start(
+            src_ref=left_src_ref,
+            dst_ref=left_dst_ref,
+            dst_device_id=left_dev,
+            src_send_sem=left_send_sem,
+            dst_recv_sem=left_recv_sem,
+        )
+
+        # right wait
+        pallas_rdma_wait_send(
+            src_ref=x_ref.at[
+                pl.ds(0, N_BATCH),
+                pl.ds(chunk_length * accross_dev + offset + half, length),
+            ],
+            src_send_sem=send_sems_half_1.at[i + half_sem],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=accross_right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            dst_recv_sem=recv_sems_half_1.at[i + half_sem],
+        )
+
+        # add remaining full chunk
+        matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * right_dev + offset + half, length)
+        ] = jnp.astype(
+            pl.dot(
+                x_ref[...],
+                w2_ref[
+                    pl.ds(0, K2),
+                    pl.ds(chunk_length * right_dev + offset + half, length),
+                ],
+            ),
+            jnp.bfloat16,
+        )
+        accross_right_dest[pl.ds(0, N_BATCH), pl.ds(offset, length)] += matmul[
+            pl.ds(0, N_BATCH), pl.ds(chunk_length * right_dev + offset + half, length)
+        ]
+
+        # send right shards to final destination
+        right_send_sem = send_sems_half_2.at[i + half_sem]
+        right_recv_sem = recv_sems_half_2.at[i + half_sem]
+        right_src_ref = accross_right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)]
+        right_dst_ref = accross_dest.at[pl.ds(0, N_BATCH), pl.ds(offset + half, length)]
+        pallas_rdma_start(
+            src_ref=right_src_ref,
+            dst_ref=right_dst_ref,
+            dst_device_id=right_dev,
+            src_send_sem=right_send_sem,
+            dst_recv_sem=right_recv_sem,
+        )
+
+    # wait for all data, intersperse accumulation
+    matmul[pl.ds(0, N_BATCH), pl.ds(chunk_length * dev_id, chunk_length)] = jnp.astype(
+        pl.dot(
+            x_ref[...],
+            w2_ref[pl.ds(0, K2), pl.ds(chunk_length * dev_id, chunk_length)],
+        ),
+        jnp.bfloat16,
+    )
+    out_ref[pl.ds(0, N_BATCH), pl.ds(0, chunk_length)] = matmul[
+        pl.ds(0, N_BATCH), pl.ds(dev_id * chunk_length, chunk_length)
+    ]
+
+    # wait for full chunks and accumulate
+    for i in range(STAGE_1_SPLIT // 2):
+        length = chunk_length // (STAGE_1_SPLIT)
+        offset = i * length
+        half = chunk_length // 2
+
+        # left wait
+        pallas_rdma_wait_send(
+            src_ref=matmul.at[
+                pl.ds(0, N_BATCH),
+                pl.ds(chunk_length * left_dev + offset + half, length),
+            ],
+            src_send_sem=send_sems_full_1.at[2 * i],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset + half, length)],
+            dst_recv_sem=recv_sems_full_1.at[2 * i],
+        )
+
+        out_ref[pl.ds(0, N_BATCH), pl.ds(offset + half, length)] += left_dest[
+            pl.ds(0, N_BATCH), pl.ds(offset + half, length)
+        ]
+
+        # right wait
+        pallas_rdma_wait_send(
+            src_ref=matmul.at[
+                pl.ds(0, N_BATCH), pl.ds(chunk_length * right_dev + offset, length)
+            ],
+            src_send_sem=send_sems_full_1.at[2 * i + 1],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            dst_recv_sem=recv_sems_full_1.at[2 * i + 1],
+        )
+
+        out_ref[pl.ds(0, N_BATCH), pl.ds(offset, length)] += right_dest[
+            pl.ds(0, N_BATCH), pl.ds(offset, length)
+        ]
+
+    # wait for accross chunks and accumulate
+    for i in range(STAGE_1_SPLIT // 2):
+        length = chunk_length // (STAGE_1_SPLIT)
+        offset = i * length
+        half = chunk_length // 2
+        half_sem = STAGE_1_SPLIT // 2
+
+        # left wait
+        pallas_rdma_wait_send(
+            src_ref=accross_left_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            src_send_sem=send_sems_half_2.at[i],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=accross_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            dst_recv_sem=recv_sems_half_2.at[i],
+        )
+
+        out_ref[pl.ds(0, N_BATCH), pl.ds(offset, length)] += accross_dest[
+            pl.ds(0, N_BATCH), pl.ds(offset, length)
+        ]
+
+        # right wait
+        pallas_rdma_wait_send(
+            src_ref=accross_right_dest.at[pl.ds(0, N_BATCH), pl.ds(offset, length)],
+            src_send_sem=send_sems_half_2.at[i + half_sem],
+        )
+        pallas_rdma_wait_recv(
+            dst_ref=accross_dest.at[pl.ds(0, N_BATCH), pl.ds(offset + half, length)],
+            dst_recv_sem=recv_sems_half_2.at[i + half_sem],
+        )
+
+        out_ref[pl.ds(0, N_BATCH), pl.ds(offset + half, length)] += accross_dest[
+            pl.ds(0, N_BATCH), pl.ds(offset + half, length)
+        ]
 
 
 def neural_network_pallas_scratch_specs(x, w1_refs, w2_refs):
