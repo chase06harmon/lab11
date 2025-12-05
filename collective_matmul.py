@@ -214,6 +214,7 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     dev_id = pallas_get_my_device_id()
     right_dev = (dev_id - 1) % N_DEVICES
     left_dev = (dev_id + 1) % N_DEVICES
+    accross_dev = (dev_id + 2) % N_DEVICES
     N_BATCH = x_ref.shape[0]  # does this work?
     X_CHUNK = x_ref.shape[1]
     K1 = w1_ref.shape[0]
@@ -223,7 +224,7 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
 
     # N_BATCH, K1
     gather_ref[pl.ds(0, N_BATCH), pl.ds(dev_id * X_CHUNK, X_CHUNK)] = x_ref[
-        pl.ds(0, X_CHUNK)
+        pl.ds(0, N_BATCH), pl.ds(0, X_CHUNK)
     ]
 
     # jax.debug.print(x_ref.at[pl.ds(0, 16)])
@@ -296,6 +297,14 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=right_recv_sem,
     )
 
+    out_ref[...] = jnp.astype(
+        pl.dot(
+            x_ref[pl.ds(0, N_BATCH), pl.ds(0, X_CHUNK)],
+            w1_ref[pl.ds(X_CHUNK * dev_id, X_CHUNK), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
+
     # left wait
     pallas_rdma_wait_send(
         src_ref=x_ref.at[pl.ds(0, N_BATCH), pl.ds(0, half)],
@@ -317,6 +326,14 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_device_id=left_dev,
         src_send_sem=left_send_sem,
         dst_recv_sem=left_recv_sem,
+    )
+
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(X_CHUNK * right_dev, half)],
+            w1_ref[pl.ds(X_CHUNK * right_dev, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
     )
 
     # right wait
@@ -348,6 +365,14 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=right_recv_sem,
     )
 
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(X_CHUNK * left_dev + half, half)],
+            w1_ref[pl.ds(X_CHUNK * left_dev + half, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
+
     # wait!
     pallas_rdma_wait_send(
         src_ref=x_ref.at[pl.ds(0, N_BATCH), pl.ds(half, half)],
@@ -360,6 +385,14 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems_half_1.at[0],
     )
 
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(X_CHUNK * right_dev + half, half)],
+            w1_ref[pl.ds(X_CHUNK * right_dev + half, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
+
     pallas_rdma_wait_send(
         src_ref=x_ref.at[pl.ds(0, N_BATCH), pl.ds(0, half)],
         src_send_sem=send_sems_half_1.at[1],
@@ -369,7 +402,15 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems_half_1.at[1],
     )
 
-    # left wait
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(X_CHUNK * left_dev, half)],
+            w1_ref[pl.ds(X_CHUNK * left_dev, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
+
+    # left wait for accross
     pallas_rdma_wait_send(
         src_ref=gather_ref.at[pl.ds(0, N_BATCH), pl.ds(right_dev * X_CHUNK, half)],
         src_send_sem=send_sems_half_2.at[0],
@@ -379,7 +420,15 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems_half_2.at[0],
     )
 
-    # right wait
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(accross_dev * X_CHUNK, half)],
+            w1_ref[pl.ds(X_CHUNK * accross_dev, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
+
+    # right wait for accross
     pallas_rdma_wait_send(
         src_ref=gather_ref.at[
             pl.ds(0, N_BATCH), pl.ds(X_CHUNK * left_dev + half, half)
@@ -393,7 +442,13 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems_half_2.at[1],
     )
 
-    out_ref[...] = jnp.astype(pl.dot(gather_ref[...], w1_ref[...]), jnp.bfloat16)
+    out_ref[...] += jnp.astype(
+        pl.dot(
+            gather_ref[pl.ds(0, N_BATCH), pl.ds(X_CHUNK * accross_dev + half, half)],
+            w1_ref[pl.ds(X_CHUNK * accross_dev + half, half), pl.ds(0, K2)],
+        ),
+        jnp.bfloat16,
+    )
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
